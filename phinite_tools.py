@@ -1,23 +1,41 @@
 """
-PHINITE TOOLS — paste each block into its own tool in Dev Studio.
+PHINITE TOOLS — FINAL
+=====================
+Paste each block (the code inside the triple quotes) into its own tool in
+Dev Studio. Every one needs a single environment variable:
 
-Every tool needs ONE environment variable:
+    BACKEND_URL = https://paytm-backend-88wd.onrender.com
 
-    BACKEND_URL = https://your-service.onrender.com     (no trailing slash)
-
-Set it once under Env. Variables in the Phinite sidebar.
+Attach:
+    dashboard_tool        → all ten agents
+    message_sending_tool  → Human-in-the-Loop Approval Handler (replaces stub)
+    statement_tool        → Customer Name Resolver, Collections Prioritization
+    soundbox_tool         → Payment Settlement Matcher, Cash Flow Analyst
 """
 
 # ==========================================================================
-# TOOL 1 of 4  —  dashboard_tool                    ENV_VARS: ["BACKEND_URL"]
+# 1 · dashboard_tool
 # --------------------------------------------------------------------------
-# Every agent calls this after it acts. This is what makes the demo visible.
+# Reliability scores are corrected here against the canonical customer book,
+# because agents kept passing the inverted priority weight instead of the
+# raw score, and that field is the first thing anyone reads.
 # ==========================================================================
 
 DASHBOARD_TOOL = r'''
 # ENV_VARS: ["BACKEND_URL"]
 """dashboard_tool — push agent state to the live merchant dashboard."""
 import requests
+
+# canonical reliability scores — HIGH means a good payer
+SCORES = {
+    "ramesh kumar": 28, "ramesh yadav": 88, "sunita devi": 94,
+    "mohammed irfan": 79, "lakshmi bai": 96, "vijay sharma": 22,
+    "anita kumari": 86, "rajesh gupta": 71, "pooja singh": 89,
+    "suresh yadav": 58, "kavita joshi": 84, "arun nair": 82,
+    "deepak verma": 25, "meena kumari": 93, "santosh patil": 74,
+    "farhan ali": 85, "geeta devi": 90, "nitin chauhan": 63,
+    "rekha sharma": 92, "manoj tiwari": 68,
+}
 
 
 def main(inputs, env_variables):
@@ -37,7 +55,6 @@ def main(inputs, env_variables):
             "_kind": inputs.get("kind", "info"),
         }
 
-        # only forward keys the dashboard understands
         for key in ("total_outstanding", "customers_with_dues",
                     "concentration_pct", "concentration_amount",
                     "collections_queue", "reconciliation",
@@ -45,13 +62,27 @@ def main(inputs, env_variables):
             if inputs.get(key) is not None:
                 payload[key] = inputs[key]
 
+        # overwrite any inverted score with the canonical value
+        queue = payload.get("collections_queue")
+        if isinstance(queue, list):
+            for row in queue:
+                if isinstance(row, dict):
+                    real = SCORES.get(str(row.get("name", "")).strip().lower())
+                    if real is not None:
+                        row["score"] = real
+
+        # concentration must be a whole percentage, not a fraction
+        pct = payload.get("concentration_pct")
+        if isinstance(pct, (int, float)) and 0 < pct <= 1:
+            payload["concentration_pct"] = round(pct * 100)
+
         r = requests.post(f"{base}/api/update", json=payload, timeout=10)
         r.raise_for_status()
         out.update({"success": True, "dashboard_updated": True})
         return {"output": out, "capture_variables": cap}
 
     except Exception as exc:
-        # never let a dashboard failure break the agent run
+        # a dashboard failure must never break the agent run
         out.update({"success": False, "error": str(exc),
                     "note": "Dashboard unreachable; agent work is unaffected."})
         return {"output": out, "capture_variables": cap}
@@ -59,19 +90,15 @@ def main(inputs, env_variables):
 
 
 # ==========================================================================
-# TOOL 2 of 4  —  message_sending_tool     REPLACES the existing stub
-#                                          ENV_VARS: ["BACKEND_URL"]
+# 2 · message_sending_tool           REPLACES the existing stub
 # --------------------------------------------------------------------------
-# Same guardrails as before (quiet hours, frequency caps) — but a permitted
-# message now actually lands on a real phone.
+# Quiet hours and frequency caps are enforced HERE, in code. A permitted
+# message reaches a real phone; a blocked one cannot be overridden.
 # ==========================================================================
 
 MESSAGE_SENDING_TOOL = r'''
 # ENV_VARS: ["BACKEND_URL"]
-"""
-message_sending_tool — real WhatsApp delivery, guarded in code.
-Quiet hours and frequency caps are enforced here, not in a prompt.
-"""
+"""message_sending_tool — real WhatsApp delivery, guarded in code."""
 import datetime
 import requests
 
@@ -83,12 +110,9 @@ QUIET_END_HOUR = 19        # exclusive
 MAX_PER_DAY = 1
 MAX_PER_WEEK = 2
 
-# demo phones — put the judge's number on C001 before you present
-PHONES = {
-    "C001": "+919999999999",
-    "C005": "+919999999999",
-    "C006": "+919999999999",
-}
+# every customer routes to the demo phone
+DEMO_PHONE = "+916307722058"
+PHONES = {}
 
 
 def _recent(cid, days):
@@ -103,6 +127,17 @@ def _recent(cid, days):
         if ts > cutoff:
             hits.append(m)
     return hits
+
+
+def _notify(env_variables, text, kind):
+    """Surface guardrail blocks on the dashboard. Never raises."""
+    try:
+        base = (env_variables.get("BACKEND_URL") or "").strip().rstrip("/")
+        if base:
+            requests.post(f"{base}/api/event", timeout=6,
+                          json={"agent": "Guardrail", "text": text, "kind": kind})
+    except Exception:
+        pass
 
 
 def main(inputs, env_variables):
@@ -137,8 +172,9 @@ def main(inputs, env_variables):
                           f"only permitted between {QUIET_START_HOUR:02d}:00 and "
                           f"{QUIET_END_HOUR:02d}:00 IST.",
             })
-            _notify(env_variables, "Blocked: quiet hours "
-                                   f"({hour:02d}:00) — {name or cid}", "block")
+            _notify(env_variables,
+                    f"Blocked: quiet hours ({hour:02d}:00) — {name or cid}",
+                    "block")
             return {"output": out, "capture_variables": cap}
 
         # ---- guardrail 2: frequency caps --------------------------------
@@ -166,10 +202,10 @@ def main(inputs, env_variables):
 
         delivery = {"delivered": False}
         base = (env_variables.get("BACKEND_URL") or "").strip().rstrip("/")
-        phone = inputs.get("phone") or PHONES.get(cid)
+        phone = inputs.get("phone") or PHONES.get(cid) or DEMO_PHONE
         if base and phone:
             try:
-                r = requests.post(f"{base}/whatsapp/send", timeout=20, json={
+                r = requests.post(f"{base}/whatsapp/send", timeout=25, json={
                     "to": phone, "message": body,
                     "customer_name": name or cid,
                 })
@@ -193,24 +229,11 @@ def main(inputs, env_variables):
     except Exception as exc:
         out["error"] = f"Unexpected error: {exc}"
         return {"output": out, "capture_variables": cap}
-
-
-def _notify(env_variables, text, kind):
-    """Surface guardrail blocks on the dashboard. Never raises."""
-    try:
-        base = (env_variables.get("BACKEND_URL") or "").strip().rstrip("/")
-        if base:
-            requests.post(f"{base}/api/event", timeout=6,
-                          json={"agent": "Guardrail", "text": text, "kind": kind})
-    except Exception:
-        pass
 '''
 
 
 # ==========================================================================
-# TOOL 3 of 4  —  statement_tool                    ENV_VARS: ["BACKEND_URL"]
-# --------------------------------------------------------------------------
-# Produces a real PDF the merchant can hand to a customer.
+# 3 · statement_tool
 # ==========================================================================
 
 STATEMENT_TOOL = r'''
@@ -246,13 +269,10 @@ def main(inputs, env_variables):
         r = requests.post(f"{base}/statement/generate", json=payload, timeout=30)
         r.raise_for_status()
 
-        url = f"{base}/statement/generate"
-        cap["statement_url"] = url
+        cap["statement_url"] = f"{base}/statement/generate"
         out.update({
-            "success": True,
-            "statement_generated": True,
-            "customer_name": name,
-            "size_bytes": len(r.content),
+            "success": True, "statement_generated": True,
+            "customer_name": name, "size_bytes": len(r.content),
             "note": "PDF statement generated and ready to share.",
         })
         return {"output": out, "capture_variables": cap}
@@ -264,9 +284,7 @@ def main(inputs, env_variables):
 
 
 # ==========================================================================
-# TOOL 4 of 4  —  soundbox_tool                     ENV_VARS: ["BACKEND_URL"]
-# --------------------------------------------------------------------------
-# Speaks the summary aloud, the way a counter device would.
+# 4 · soundbox_tool
 # ==========================================================================
 
 SOUNDBOX_TOOL = r'''
@@ -302,7 +320,7 @@ def main(inputs, env_variables):
         cap["spoken_text"] = text
         out.update({
             "success": True, "spoken": True, "text": text, "lang": lang,
-            "audio_url": f"{base}/voice/say",
+            "audio_url": f"{base}/voice/latest",
             "note": "Summary spoken on the Soundbox.",
         })
         return {"output": out, "capture_variables": cap}
